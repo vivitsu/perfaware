@@ -1,5 +1,6 @@
 use std::{
     path::Path,
+    fmt::Display,
     fs::{read, OpenOptions},
     io::{Write, Result},
 };
@@ -20,38 +21,128 @@ impl ByteStream {
         })
     }
 
-    pub fn read_u8(&mut self) -> Option<u8> {
+    pub fn read_byte(&mut self) -> Option<u8> {
         if self.pos == self.bytes.len() {
             return None;
         }
         let byte = self.bytes[self.pos];
         self.pos += 1;
         Some(byte)
-    }    
+    }
 }
 
-enum Masks {
-    OpCode = 0b1111_1100,
-    Direction = 0b0000_0010,
-    WideOrByte = 0b0000_0001,
-    Mode = 0b1100_0000,
-    Register = 0b0011_1000,
-    RegOrMem = 0b0000_0111,
+#[derive(PartialEq, Eq)]
+enum Mode {
+    Mem,    
+    MemByte,
+    MemWord,
+    Reg,
+    None
 }
 
-enum OpCode {
-    MOV = 0b1000_1000,
+#[derive(PartialEq, Eq)]
+enum Direction {
+    RegSrc,
+    RegDst,
 }
 
 struct InstPart<'a> {
     opcode: &'a str,
-    direction: bool,
+    direction: Direction,
     wide: bool,
     mode: Mode,
+    reg: u8,
+    rm: u8,
+    disp: u16,
+    // true if are there more parts to parse for this instruction
+    next: bool,
 }
 
-enum Mode {
+impl<'a> InstPart<'a> {
+    fn new() -> InstPart<'a> {
+        Self {
+            opcode: "",
+            direction: Direction::RegSrc,
+            wide: false,
+            mode: Mode::None,            
+            reg: 0,
+            rm: 0,
+            disp: 0,
+            next: false,
+        }
+    }
 
+    fn parse(&mut self, byte: u8) {
+        if byte & OPCODE == MOV {
+            self.opcode = "mov";
+            // mov is a multi-byte instruction
+            self.next = true;
+            let dir_bit = (byte & DIRECTION) >> 1;
+            if dir_bit == 1 {
+                self.direction = Direction::RegDst;
+            } else {
+                assert!(dir_bit == 0);
+                self.direction = Direction::RegSrc;
+            }
+            let wide_bit = byte & WIDE_OR_BYTE;
+            if wide_bit == 1 {
+                self.wide = true;
+            } else {
+                assert!(wide_bit == 0);
+                self.wide = false;
+            }
+        } else {
+            if self.mode == Mode::None {
+                let mode = (byte & MODE) >> 6;
+                if mode == 3 {
+                    self.mode = Mode::Reg;
+                    self.next = false;
+                }
+                self.reg = (byte & REGISTER) >> 3;
+                self.rm = byte & REG_MEM as u8;
+                // only handle reg mode for now
+            }
+            // only handle 2 byte mov instructions for now
+        }
+    }
+
+    fn into_inst(&self) -> Inst {
+        let mut reg = "";
+        let mut rm = "";
+        let mut dst = "";
+        let mut src = "";
+        if self.wide {
+            reg = WIDE_REGS[self.reg as usize];
+            if self.mode == Mode::Reg {
+                rm = WIDE_REGS[self.rm as usize];
+            }
+        } else {
+            assert!(!self.wide);
+            reg = BYTE_REGS[self.reg as usize];
+            if self.mode == Mode::Reg {
+                rm = BYTE_REGS[self.rm as usize];
+            }
+        }
+
+        if self.direction == Direction::RegDst {
+            dst = reg;
+            src = rm;
+        } else {
+            assert!(self.direction == Direction::RegSrc);
+            src = reg;
+            dst = rm;
+        }
+
+        Inst {
+            mnemonic: self.opcode,
+            dst,
+            src
+        }        
+    }
+
+    fn has_next(&self) -> bool {
+        self.next
+    }
 }
 
 struct Inst<'a> {
@@ -60,82 +151,64 @@ struct Inst<'a> {
     src: &'a str,
 }
 
-const byte_regs: [&str; 8] = ["al", "cl", "bl", "dl", "ah", "ch", "bh", "dh"];
-const wide_regs: [&str; 8] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
+impl<'a> Display for Inst<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}, {}", self.mnemonic, self.dst, self.src)
+    }
+}
+
+// register lookup table
+const BYTE_REGS: [&str; 8] = ["al", "cl", "bl", "dl", "ah", "ch", "bh", "dh"];
+const WIDE_REGS: [&str; 8] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
+
+// masks
+const OPCODE: u8 = 0b1111_1100;
+const DIRECTION: u8 = 0b0000_0010;
+const WIDE_OR_BYTE: u8 = 0b0000_0001;
+const MODE: u8 = 0b1100_0000;
+const REGISTER: u8 = 0b0011_1000;
+const REG_MEM: u8 = 0b0000_0111;
+
+// opcodes
+const MOV: u8 = 0b1000_1000;
 
 fn main() -> Result<()> {
-    let path = Path::new("computer_enhance/perfaware/part1/listing_0037_single_register_mov");
-    let bytes = read(path).unwrap();
-    let mut decoded = OpenOptions::new().read(true).write(true).create(true).open("decoded").expect("could not create file");
+    let path = Path::new("computer_enhance/perfaware/part1/listing_0038_many_register_mov");
+    let mut stream = ByteStream::new(path).expect("could not open file");
+    let mut decoded = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open("decoded")
+        .expect("could not create file");
 
-    assert!(bytes.len() == 2);
-
-    let opcode_mask: u8 = 0b1111_1100;
-    let d_mask: u8 = 0b0000_0010;
-    let w_mask: u8 = 0b0000_0001;
-    let mod_mask: u8 = 0b1100_0000;
-    let reg_mask: u8 = 0b0011_1000;
-    let rm_mask: u8 = 0b0000_0111;
-
-    let mov_opcode: u8 = 0b1000_1000;
-
-    // Read first byte
-    let b1 = bytes[0];
-    let opcode = b1 & opcode_mask;
-    let direction = b1 & d_mask;
-    let wide_mode = b1 & w_mask;
-
-    let b2 = bytes[1];
-    let mode = b2 & mod_mask;
-    let reg = b2 & reg_mask;
-    let rm = b2 & rm_mask;
 
     writeln!(decoded, "bits 16")?;
-    writeln!(decoded, "")?;
-
-    if opcode == mov_opcode {
-        write!(decoded, "mov ")?;
-    }
-
-    let mut dest = String::new();
-    let mut src = String::new();
-
-    if direction == 2 {
-        // reg defines destination
-        if wide_mode == 1 {
-            dest = "cx".to_string(); // hard code something for now
-        } else {
-            dest = "cl".to_string();
-        }
-    } else {
-        assert!(direction == 0);
-        if wide_mode == 1 {
-            src = "cx".to_string(); // hard code something for now
-        } else {
-            src = "cl".to_string();
-        }
-    }
-
-    if mode == 0b1100_0000 {
-        if src.is_empty() {
-            if wide_mode == 1 {
-                src = "ax".to_string();
-            } else {
-                src = "al".to_string();
-            }
-        } else {
-            assert!(!src.is_empty());
-            assert!(dest.is_empty());
-            if wide_mode == 1 {
-                dest = "ax".to_string();
-            } else {
-                dest = "al".to_string();
-            }
-        }
-    }
-
-    write!(decoded, "{}, {}", dest, src)?;
     writeln!(decoded)?;
 
+    // indicates if we should start processing bytes as a new instruction
+    let mut is_new = true;
+    let mut parts = InstPart::new();
+
+    loop {
+        if let Some(byte) = stream.read_byte() {
+            if is_new {
+                // extract opcode, etc
+                parts = InstPart::new(); // todo - avoid 
+                parts.parse(byte);
+                is_new = false;
+                continue;
+            } else {
+                parts.parse(byte);
+                if !parts.has_next() {
+                    let inst: Inst = parts.into_inst();                    
+                    writeln!(decoded, "{}", inst.to_string())?;
+                    is_new = true
+                }
+                continue;
+            }
+        }
+        break;
+    }
     Ok(())
 }
